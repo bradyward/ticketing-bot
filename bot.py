@@ -1,9 +1,15 @@
-import discord
-from discord.ext import commands, tasks
-from discord import app_commands
+import asyncio
 import os
 from datetime import datetime, timedelta, time
-import asyncio
+
+import discord
+import mysql.connector
+from discord import app_commands
+from discord.ext import commands, tasks
+from mysql.connector import Error
+
+from dotenv import load_dotenv
+load_dotenv()
 
 # Configure bot
 intents = discord.Intents.default()
@@ -13,12 +19,15 @@ intents.reactions = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ===== CONFIGURABLE VARIABLES =====
-LEAD_BUTTON_TIMEOUT_MINUTES = 0
-SAMPLE_LEADS = [
-    {"name": "John Smith", "phone": "555-0001", "email": "john@example.com"},
-    {"name": "Jane Doe", "phone": "555-0002", "email": "jane@example.com"},
-    {"name": "Bob Johnson", "phone": "555-0003", "email": "bob@example.com"},
-]
+LEAD_BUTTON_TIMEOUT_MINUTES = 5
+NUM_LEADS = 3
+DELETE_LEADS = True  # Move leads from new_leads to old_leads after retrieval
+
+# Database configuration
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_NAME = os.getenv("DB_NAME", "leads_db")
 # ===================================
 
 # Store ticket data and lead tracking
@@ -39,11 +48,50 @@ STAFF_ROLE = "ticket_staff"
 CALLER_ROLE = "caller"
 VIEWER_ROLE = "*"
 
+
+# ===== DATABASE FUNCTIONS =====
+def get_leads_from_database():
+    """Retrieve leads from the database"""
+    try:
+        conn = mysql.connector.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME
+        )
+        cursor = conn.cursor(dictionary=True)
+        
+        # Retrieve leads from new_leads table
+        query = f"SELECT business_name, city, phone_number FROM new_leads LIMIT {NUM_LEADS}"
+        cursor.execute(query)
+        leads = cursor.fetchall()
+        
+        if leads and DELETE_LEADS:
+            # Move leads to old_leads table
+            for lead in leads:
+                insert_query = "INSERT INTO old_leads (business_name, city, phone_number) VALUES (%s, %s, %s)"
+                cursor.execute(insert_query, (lead['business_name'], lead['city'], lead['phone_number']))
+            
+            # Delete from new_leads
+            delete_query = f"DELETE FROM new_leads LIMIT {NUM_LEADS}"
+            cursor.execute(delete_query)
+            conn.commit()
+        
+        cursor.close()
+        conn.close()
+        return leads
+    except Error as e:
+        print(f"Database error: {e}")
+        return []
+
+
+# ===== BOT EVENTS =====
 @bot.event
 async def on_ready():
     print(f"✓ Bot logged in as {bot.user}")
     await bot.tree.sync()
     daily_report.start()
+
 
 @bot.event
 async def on_reaction_add(reaction, user):
@@ -88,6 +136,8 @@ async def on_reaction_add(reaction, user):
     except Exception as e:
         print(f"Error closing ticket: {e}")
 
+
+# ===== BOT COMMANDS =====
 @bot.command()
 async def setup(ctx):
     """Setup command to create all roles and channels"""
@@ -188,6 +238,7 @@ async def setup(ctx):
         await ctx.send(f"⚠ Error during setup: {e}")
         print(f"Setup error: {e}")
 
+
 @bot.command()
 async def init_entry(ctx):
     """Initialize the entry channel with the ticket button"""
@@ -203,13 +254,6 @@ async def init_entry(ctx):
     await init_entry_internal(channel)
     await ctx.send("✓ Entry message sent.")
 
-async def init_entry_internal(channel):
-    embed = discord.Embed(
-        title="Create a Support Ticket",
-        description="Click the button below to create a support ticket.",
-        color=discord.Color.blue()
-    )
-    await channel.send(embed=embed, view=CreateTicketView())
 
 @bot.command()
 async def init_leads(ctx):
@@ -226,6 +270,17 @@ async def init_leads(ctx):
     await init_leads_internal(channel)
     await ctx.send("✓ Leads message sent.")
 
+
+# ===== HELPER FUNCTIONS =====
+async def init_entry_internal(channel):
+    embed = discord.Embed(
+        title="Create a Support Ticket",
+        description="Click the button below to create a support ticket.",
+        color=discord.Color.blue()
+    )
+    await channel.send(embed=embed, view=CreateTicketView())
+
+
 async def init_leads_internal(channel):
     embed = discord.Embed(
         title="Get Leads",
@@ -234,6 +289,8 @@ async def init_leads_internal(channel):
     )
     await channel.send(embed=embed, view=GetLeadsView())
 
+
+# ===== UI VIEWS =====
 class CreateTicketView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -289,6 +346,7 @@ class CreateTicketView(discord.ui.View):
         else:
             await interaction.response.send_message("Viewer role not found.", ephemeral=True)
 
+
 class TicketFormView(discord.ui.View):
     def __init__(self, user_id, channel_id):
         super().__init__(timeout=None)
@@ -321,6 +379,7 @@ class TicketFormView(discord.ui.View):
         if ticket_channel:
             await asyncio.sleep(1)
             await ticket_channel.delete()
+
 
 class GetLeadsView(discord.ui.View):
     def __init__(self):
@@ -363,10 +422,18 @@ class GetLeadsView(discord.ui.View):
             }
         )
         
+        # Retrieve leads from database
+        leads = get_leads_from_database()
+        
+        if not leads:
+            await lead_channel.send("❌ No leads available at this time.")
+            await interaction.response.send_message("❌ No leads available.", ephemeral=True)
+            return
+        
         # Build single message with all leads
         leads_text = "\n".join([
-            f"**{i+1}. {lead['name']}**\nPhone: {lead['phone']}\nEmail: {lead['email']}\n"
-            for i, lead in enumerate(SAMPLE_LEADS)
+            f"**{i+1}. {lead['business_name']}**\nCity: {lead['city']}\nPhone: {lead['phone_number']}\n"
+            for i, lead in enumerate(leads)
         ])
         
         embed = discord.Embed(
@@ -379,8 +446,10 @@ class GetLeadsView(discord.ui.View):
         lead_channel_messages[msg.id] = (user_id, lead_channel.id)
         await msg.add_reaction("❌")
         
-        await interaction.response.send_message(f"✓ {len(SAMPLE_LEADS)} leads created in {lead_channel.mention}!", ephemeral=True)
+        await interaction.response.send_message(f"✓ {len(leads)} leads created in {lead_channel.mention}!", ephemeral=True)
 
+
+# ===== SCHEDULED TASKS =====
 @tasks.loop(time=time(23, 59))  # Run at 11:59 PM daily
 async def daily_report():
     """Send daily report of lead button presses"""
@@ -409,6 +478,7 @@ async def daily_report():
     
     # Reset daily counts
     daily_lead_counts.clear()
+
 
 # Run the bot
 bot.run(os.getenv("DISCORD_TOKEN"))
